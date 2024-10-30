@@ -66,12 +66,15 @@ async fn main() {
                             None => {
                                 if let Some(started) = timer {
                                     if e.timestamp - started > noinput_timeout {
-                                        println!("NOINPUT");
+                                        println!("**** NOINPUT ****");
                                         break;
                                     }
                                 }
                             }
                             partial => {
+                                if timer.is_some() {
+                                    println!("*** INPUT STARTED ***");
+                                }
                                 timer = None;
                                 recognized = partial;
                             }
@@ -152,6 +155,7 @@ async fn main() {
                 }
             }
         }
+        println!("STOP receiving messages from STT.");
     });
 
     streaming_tx
@@ -230,7 +234,10 @@ async fn main() {
             break;
         }
     }
-    println!("Sending stream is over");
+    drop(streaming_tx);
+    let sleep_duration = tokio::time::Duration::from_secs(3);
+    println!("Sending stream is over. Sleep {:?}", sleep_duration);
+    tokio::time::sleep(sleep_duration).await;
 }
 
 fn tls_config() -> tonic::transport::ClientTlsConfig {

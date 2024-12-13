@@ -1,6 +1,7 @@
 use std::sync::Arc;
 
 use tokio::{io::AsyncReadExt, sync::mpsc};
+use ya::RecognitionClassifierResult;
 
 pub mod ya {
     tonic::include_proto!("speechkit.stt.v3");
@@ -55,7 +56,7 @@ async fn main() {
     tokio::spawn(async move {
         let mut recognized = None;
         while let Some(msg) = vendor_rx.recv().await {
-            println!("FROM vendor: {:#?}", msg);
+            // println!("FROM vendor: {:#?}", msg);
             match msg {
                 Ok(e) => {
                     if e.is_final {
@@ -95,10 +96,14 @@ async fn main() {
     tokio::spawn(async move {
         let resp = client.recognize_streaming(req).await.unwrap();
         let mut stream = resp.into_inner();
+        let mut result = None;
+        let mut timestamp = 0;
+        let mut attributes = Vec::new();
         while let Ok(msg) = stream.message().await.inspect_err(|status| {
             println!("ERROR: {:?}", status);
             vendor_tx.blocking_send(Err(status.clone())).unwrap();
         }) {
+            println!("FROM YA: {:#?}", msg);
             match msg {
                 Some(ya::StreamingResponse {
                     audio_cursors:
@@ -108,46 +113,52 @@ async fn main() {
                     event: Some(e),
                     ..
                 }) => {
-                    let vendor_msg = match e {
+                    match e {
                         ya::streaming_response::Event::Partial(ya::AlternativeUpdate {
                             alternatives,
                             ..
-                        }) => event::VendorMessage {
-                            timestamp: partial_time_ms,
-                            is_final: false,
-                            transcript: alternatives.first().map(|a| a.text.clone()),
-                        },
-                        ya::streaming_response::Event::Final(ya::AlternativeUpdate {
+                        })
+                        | ya::streaming_response::Event::Final(ya::AlternativeUpdate {
                             alternatives,
                             ..
-                        }) => event::VendorMessage {
-                            timestamp: partial_time_ms,
-                            is_final: false,
-                            transcript: alternatives.first().map(|a| a.text.clone()),
-                        },
-                        ya::streaming_response::Event::EouUpdate(_eou_update) => {
-                            println!("END of Uttrance");
-                            continue;
-                        }
-                        ya::streaming_response::Event::FinalRefinement(ya::FinalRefinement {
+                        })
+                        | ya::streaming_response::Event::FinalRefinement(ya::FinalRefinement {
                             r#type:
                                 Some(ya::final_refinement::Type::NormalizedText(
                                     ya::AlternativeUpdate { alternatives, .. },
                                 )),
                             ..
-                        }) => event::VendorMessage {
-                            timestamp: partial_time_ms,
-                            is_final: true,
-                            transcript: alternatives.first().map(|a| a.text.clone()),
-                        },
+                        }) => {
+                            result = build_transcript(alternatives);
+                            timestamp = partial_time_ms;
+                            let vendor_msg = event::VendorMessage {
+                                timestamp: partial_time_ms,
+                                is_final: false,
+                                transcript: result.clone(),
+                            };
+                            let _ = vendor_tx
+                                .send(Ok(vendor_msg))
+                                .await
+                                .inspect_err(|_| println!("STILL receiving messages from STT"));
+                        }
+                        ya::streaming_response::Event::EouUpdate(_eou_update) => {
+                            println!("END of Uttrance");
+                            break;
+                        }
+                        ya::streaming_response::Event::ClassifierUpdate(
+                            ya::RecognitionClassifierUpdate {
+                                classifier_result: Some(classified),
+                                ..
+                            },
+                        ) => {
+                            if let Some(attribute) = from_classified(classified) {
+                                attributes.push(attribute);
+                            }
+                        }
                         _ => {
                             continue;
                         }
                     };
-                    let _ = vendor_tx
-                        .send(Ok(vendor_msg))
-                        .await
-                        .inspect_err(|_| println!("STILL receiving messages from STT"));
                 }
                 None => break,
                 Some(resp) => {
@@ -155,6 +166,19 @@ async fn main() {
                 }
             }
         }
+        let _ = vendor_tx
+            .send(Ok(event::VendorMessage {
+                timestamp,
+                is_final: true,
+                transcript: result.map(|t| {
+                    if attributes.is_empty() {
+                        t
+                    } else {
+                        format!("({})\n{}", attributes.join(","), t)
+                    }
+                }),
+            }))
+            .await;
         println!("STOP receiving messages from STT.");
     });
 
@@ -199,7 +223,46 @@ async fn main() {
                         ),
                     ),
                 }),
-                recognition_classifier: None,
+                recognition_classifier: Some(ya::RecognitionClassifierOptions {
+                    classifiers: vec![
+                        ya::RecognitionClassifier {
+                            classifier: "formal_greeting".to_string(),
+                            triggers: vec![ya::recognition_classifier::TriggerType::OnFinal.into()]
+                        },
+                        ya::RecognitionClassifier {
+                            classifier: "informal_greeting".to_string(),
+                            triggers: vec![ya::recognition_classifier::TriggerType::OnFinal.into()]
+                        },
+                        ya::RecognitionClassifier {
+                            classifier: "formal_farewell".to_string(),
+                            triggers: vec![ya::recognition_classifier::TriggerType::OnFinal.into()]
+                        },
+                        ya::RecognitionClassifier {
+                            classifier: "informal_farewell".to_string(),
+                            triggers: vec![ya::recognition_classifier::TriggerType::OnFinal.into()]
+                        },
+                        ya::RecognitionClassifier {
+                            classifier: "insult".to_string(),
+                            triggers: vec![ya::recognition_classifier::TriggerType::OnFinal.into()]
+                        },
+                        ya::RecognitionClassifier {
+                            classifier: "profanity".to_string(),
+                            triggers: vec![ya::recognition_classifier::TriggerType::OnFinal.into()]
+                        },
+                        ya::RecognitionClassifier {
+                            classifier: "gender".to_string(),
+                            triggers: vec![ya::recognition_classifier::TriggerType::OnFinal.into()]
+                        },
+                        ya::RecognitionClassifier {
+                            classifier: "negative".to_string(),
+                            triggers: vec![ya::recognition_classifier::TriggerType::OnFinal.into()]
+                        },
+                        ya::RecognitionClassifier {
+                            classifier: "answerphone".to_string(),
+                            triggers: vec![ya::recognition_classifier::TriggerType::OnFinal.into()]
+                        },
+                    ]
+                }),
                 speech_analysis: None,
                 speaker_labeling: None,
             },
@@ -277,5 +340,38 @@ async fn issue_iam_token(oauth: &str) -> Option<String> {
             );
             None
         }
+    }
+}
+
+fn build_transcript(alternatives: Vec<ya::Alternative>) -> Option<String> {
+    alternatives.first().map(|a| a.text.clone())
+}
+
+fn from_classified(classified: ya::RecognitionClassifierResult) -> Option<String> {
+    let ya::RecognitionClassifierResult {
+        classifier,
+        highlights,
+        labels,
+    } = classified;
+    match classifier.as_str() {
+        "formal_greeting" | "informal_greeting" | "informal_farewell" | "profanity" | "insult"
+        | "formal_farewell" | "negative" | "answerphone" => labels.first().and_then(|label| {
+            if label.confidence > 0.5 {
+                Some(classifier)
+            } else {
+                None
+            }
+        }),
+        "gender" => labels
+            .into_iter()
+            .filter_map(|label| {
+                if label.confidence > 0.95 {
+                    Some(label.label)
+                } else {
+                    None
+                }
+            })
+            .next(),
+        _ => None,
     }
 }
